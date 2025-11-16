@@ -33,7 +33,6 @@ const OptionsFlowUI = () => {
     connectWebSocket();
     fetchAutoTradeStatus();
 
-    // cleanup
     return () => {
       if (ws) ws.close();
     };
@@ -57,16 +56,11 @@ const OptionsFlowUI = () => {
     websocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
 
-      if (data.type === 'TRADE') {
-        setFlows((prev) => [data, ...prev].slice(0, 100));
-      } else if (data.type === 'PRINT') {
+      if (data.type === 'TRADE' || data.type === 'PRINT') {
         setFlows((prev) => [data, ...prev].slice(0, 100));
       } else if (
         data.type === 'AUTO_TRADE_EXECUTED' ||
-        data.type === 'AUTO_TRADE_CLOSED'
-      ) {
-        fetchAutoTradeStatus();
-      } else if (
+        data.type === 'AUTO_TRADE_CLOSED' ||
         data.type === 'SIMULATED_TRADE' ||
         data.type === 'PAPER_TRADE' ||
         data.type === 'SIMULATED_TRADE_CLOSED'
@@ -197,6 +191,17 @@ const OptionsFlowUI = () => {
 
   const openPositions = positions.filter((p) => p.status === 'OPEN');
 
+  // 🔼 Sort all flow items by strongest stanceScore (absolute value), then by newest timestamp
+  const sortedFlows = [...flows].sort((a, b) => {
+    const sa = Math.abs(a.stanceScore || 0);
+    const sb = Math.abs(b.stanceScore || 0);
+    if (sb !== sa) return sb - sa;
+
+    const ta = a.timestamp || 0;
+    const tb = b.timestamp || 0;
+    return tb - ta;
+  });
+
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100 p-4">
       {/* Header */}
@@ -228,7 +233,7 @@ const OptionsFlowUI = () => {
               </span>
             </div>
 
-            {/* Auto trade button (grey when off, green when on) */}
+            {/* Auto trade button */}
             <button
               onClick={toggleAutoTrade}
               className={`px-6 py-2 rounded-lg font-bold transition-all ${
@@ -412,17 +417,18 @@ const OptionsFlowUI = () => {
             </span>
           </h3>
           <div className="space-y-2 max-h-96 overflow-y-auto">
-            {flows.length === 0 ? (
+            {sortedFlows.length === 0 ? (
               <div className="text-gray-500 text-center py-8">
                 Waiting for flow data...
               </div>
             ) : (
-              flows.map((flow, i) => {
+              sortedFlows.map((flow, i) => {
                 const key =
                   flow.timestamp ||
                   `${flow.symbol}-${flow.conid || i}-${i}`;
                 const stanceScore = flow.stanceScore || 0;
                 const volOi = flow.volOiRatio ?? null;
+                const stanceLabel = flow.stanceLabel || '';
 
                 return (
                   <div
@@ -448,9 +454,10 @@ const OptionsFlowUI = () => {
                           className="font-bold"
                           style={{ color: getStanceColor(stanceScore) }}
                         >
-                          {(flow.stanceLabel || 'NEUTRAL') +
-                            ' ' +
-                            stanceScore.toFixed(0)}
+                          {/* Removed hardcoded 'NEUTRAL' fallback */}
+                          {stanceLabel
+                            ? `${stanceLabel} ${stanceScore.toFixed(0)}`
+                            : stanceScore.toFixed(0)}
                         </div>
                         <div className="text-xs text-gray-400">
                           Conf: {(flow.confidence || 0).toFixed(0)}%
@@ -575,4 +582,3 @@ const OptionsFlowUI = () => {
 };
 
 export default OptionsFlowUI;
-

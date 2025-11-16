@@ -56,9 +56,18 @@ const OptionsFlowUI = () => {
     websocket.onmessage = (event) => {
       const data = JSON.parse(event.data);
 
-      if (data.type === 'TRADE' || data.type === 'PRINT') {
-        setFlows((prev) => [data, ...prev].slice(0, 100));
-      } else if (
+      // ✅ Treat CALL / PUT as flow events too
+      if (
+        data.type === 'TRADE' ||
+        data.type === 'PRINT' ||
+        data.type === 'CALL' ||
+        data.type === 'PUT'
+      ) {
+        setFlows((prev) => [data, ...prev].slice(0, 300));
+        return;
+      }
+
+      if (
         data.type === 'AUTO_TRADE_EXECUTED' ||
         data.type === 'AUTO_TRADE_CLOSED' ||
         data.type === 'SIMULATED_TRADE' ||
@@ -106,7 +115,9 @@ const OptionsFlowUI = () => {
   };
 
   const toggleAutoTrade = async () => {
-    const endpoint = autoTradeEnabled ? '/auto-trade/disable' : '/auto-trade/enable';
+    const endpoint = autoTradeEnabled
+      ? '/auto-trade/disable'
+      : '/auto-trade/enable';
     try {
       await fetch(`${API_BASE}${endpoint}`, { method: 'POST' });
       fetchAutoTradeStatus();
@@ -154,6 +165,58 @@ const OptionsFlowUI = () => {
     ));
   };
 
+  // ----------------- Delta helpers -----------------
+
+  // Infer a "direction" even when direction is missing (PRINTs)
+  const inferDirection = (flow) => {
+    if (flow.direction) return flow.direction; // BTO / STO / BTC / STC already set
+
+    // If we have aggressor info from the server, map it:
+    if (flow.aggressor === true) return 'BTO'; // buyer-agg → treat as long
+    if (flow.aggressor === false) return 'STO'; // seller-agg → treat as short
+
+    // Fallback to stance if available
+    if (flow.stanceLabel === 'BULL') return 'BTO';
+    if (flow.stanceLabel === 'BEAR') return 'STO';
+
+    return null;
+  };
+
+  // Compute signed delta contribution for a single flow
+  const getSignedDelta = (flow) => {
+    const size = flow.size || flow.tradeSize || 0;
+    if (!size) return 0;
+
+    let baseDelta = 0;
+
+    // If greeks.delta exists (options), use that
+    if (flow.greeks && typeof flow.greeks.delta === 'number') {
+      baseDelta = flow.greeks.delta;
+    } else {
+      // Futures or UL prints (e.g. /ES): approximate delta = 1
+      if ((flow.symbol || '').startsWith('/')) {
+        baseDelta = 1;
+      } else {
+        return 0; // nothing useful, skip this flow
+      }
+    }
+
+    // First, prefer stanceLabel for sign (server already classifies bull/bear)
+    let sign = 0;
+    if (flow.stanceLabel === 'BULL') sign = 1;
+    else if (flow.stanceLabel === 'BEAR') sign = -1;
+    else {
+      // Fallback to direction mapping if stanceLabel is missing/neutral
+      const dir = inferDirection(flow);
+      if (dir === 'BTO' || dir === 'STC') sign = 1;
+      else if (dir === 'STO' || dir === 'BTC') sign = -1;
+    }
+
+    if (!sign) return 0;
+
+    return baseDelta * size * sign;
+  };
+
   // Aggregate flows by symbol for sentiment chart
   const flowsBySymbol = flows.reduce((acc, flow) => {
     const sym = flow.symbol || 'UNKNOWN';
@@ -174,6 +237,35 @@ const OptionsFlowUI = () => {
       neutral: data.neutral,
     }),
   );
+
+  // 🔢 Net delta aggregation (all flows + by symbol)
+  const deltaAgg = flows.reduce(
+    (acc, flow) => {
+      const sym = flow.symbol || 'UNKNOWN';
+      const d = getSignedDelta(flow);
+      if (!d) return acc;
+
+      acc.total += d;
+      acc.bySymbol[sym] = (acc.bySymbol[sym] || 0) + d;
+      return acc;
+    },
+    { total: 0, bySymbol: {} },
+  );
+
+  const netDeltaTotal = deltaAgg.total;
+  const netDeltaBySymbol = deltaAgg.bySymbol;
+
+  // Overall flow label from net delta
+  let overallFlowLabel = 'NEUTRAL';
+  let overallFlowColor = '#f59e0b';
+
+  if (netDeltaTotal > 5) {
+    overallFlowLabel = 'BULL';
+    overallFlowColor = '#10b981';
+  } else if (netDeltaTotal < -5) {
+    overallFlowLabel = 'BEAR';
+    overallFlowColor = '#ef4444';
+  }
 
   // P&L over time
   const closedForPnl = positions.filter((p) => p.status === 'CLOSED');
@@ -248,7 +340,7 @@ const OptionsFlowUI = () => {
         </div>
 
         {/* Stats row */}
-        <div className="grid grid-cols-4 gap-4">
+        <div className="grid grid-cols-4 gap-4 mb-4">
           <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
             <div className="text-gray-400 text-sm mb-1">Total P&amp;L</div>
             <div
@@ -276,6 +368,48 @@ const OptionsFlowUI = () => {
             <div className="text-2xl font-bold text-yellow-400">
               {stats.openPositions}
             </div>
+          </div>
+        </div>
+
+        {/* Flow stats row */}
+        <div className="grid grid-cols-3 gap-4">
+          <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div className="text-gray-400 text-sm mb-1">Net Δ (All Flow)</div>
+            <div
+              className="text-2xl font-bold"
+              style={{ color: getStanceColor(netDeltaTotal) }}
+            >
+              {netDeltaTotal.toFixed(1)}Δ
+            </div>
+          </div>
+
+          <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div className="text-gray-400 text-sm mb-1">Overall Flow</div>
+            <div
+              className="text-2xl font-bold"
+              style={{ color: overallFlowColor }}
+            >
+              {overallFlowLabel}
+            </div>
+          </div>
+
+          <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
+            <div className="text-gray-400 text-sm mb-1">Net Δ by Symbol</div>
+            {Object.keys(netDeltaBySymbol).length === 0 ? (
+              <div className="text-xs text-gray-500 mt-1">No delta yet</div>
+            ) : (
+              <div className="flex flex-wrap gap-2 mt-1 text-sm">
+                {Object.entries(netDeltaBySymbol).map(([sym, d]) => (
+                  <span
+                    key={sym}
+                    className="px-2 py-1 rounded bg-gray-900 border border-gray-700"
+                    style={{ color: getStanceColor(d) }}
+                  >
+                    {sym}: {d.toFixed(1)}Δ
+                  </span>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -397,7 +531,10 @@ const OptionsFlowUI = () => {
                           parseFloat(pnl) >= 0 ? 'bg-green-500' : 'bg-red-500'
                         }`}
                         style={{
-                          width: `${Math.min(Math.abs(parseFloat(pnl)) * 2, 100)}%`,
+                          width: `${Math.min(
+                            Math.abs(parseFloat(pnl)) * 2,
+                            100,
+                          )}%`,
                         }}
                       />
                     </div>
@@ -430,6 +567,9 @@ const OptionsFlowUI = () => {
                 const volOi = flow.volOiRatio ?? null;
                 const stanceLabel = flow.stanceLabel || '';
 
+                // Use same inferred direction we use for delta calc
+                const inferredDir = inferDirection(flow);
+
                 return (
                   <div
                     key={key}
@@ -444,7 +584,9 @@ const OptionsFlowUI = () => {
                           {flow.type || flow.right}
                         </span>
                         {flow.strike && (
-                          <span className="text-gray-300">${flow.strike}</span>
+                          <span className="text-gray-300">
+                            ${flow.strike}
+                          </span>
                         )}
                         {flow.classifications &&
                           getClassificationBadge(flow.classifications)}
@@ -454,7 +596,6 @@ const OptionsFlowUI = () => {
                           className="font-bold"
                           style={{ color: getStanceColor(stanceScore) }}
                         >
-                          {/* Removed hardcoded 'NEUTRAL' fallback */}
                           {stanceLabel
                             ? `${stanceLabel} ${stanceScore.toFixed(0)}`
                             : stanceScore.toFixed(0)}
@@ -470,13 +611,14 @@ const OptionsFlowUI = () => {
                         <div className="text-gray-400">Direction</div>
                         <div
                           className={`font-semibold ${
-                            flow.direction === 'BTO' ||
-                            flow.direction === 'BTC'
+                            inferredDir === 'BTO' || inferredDir === 'BTC'
                               ? 'text-green-400'
-                              : 'text-orange-400'
+                              : inferredDir === 'STO' || inferredDir === 'STC'
+                              ? 'text-orange-400'
+                              : 'text-gray-500'
                           }`}
                         >
-                          {flow.direction}
+                          {inferredDir || '--'}
                         </div>
                       </div>
                       <div>
